@@ -99,8 +99,17 @@ struct ImGui_ImplVulkan_ViewportData
     bool                                    WindowOwned;
     ImGui_ImplVulkanH_Window                Window;             // Used by secondary viewports only
     ImGui_ImplVulkanH_WindowRenderBuffers   RenderBuffers;      // Used by all viewports
+    // DesertEngine: RenderWindow submitted an acquired image, so SwapBuffers presents it. A RenderWindow that
+    // failed (its acquire, its fence wait, its recording or its submit) leaves it false: nothing waits an
+    // unsignalled semaphore and no index that was not acquired is presented.
+    bool PresentPending;
 
-    ImGui_ImplVulkan_ViewportData()         { WindowOwned = false; memset(&RenderBuffers, 0, sizeof(RenderBuffers)); }
+    ImGui_ImplVulkan_ViewportData()
+    {
+        WindowOwned    = false;
+        PresentPending = false;
+        memset( &RenderBuffers, 0, sizeof( RenderBuffers ) );
+    }
     ~ImGui_ImplVulkan_ViewportData()        { }
 };
 
@@ -1320,14 +1329,33 @@ int ImGui_ImplVulkanH_GetMinImageCountFromPresentMode(VkPresentModeKHR present_m
     return 1;
 }
 
+// DesertEngine: the window's own frames, in place of a device idle. Every frame's fence signals once the last
+// submit that used the frame ran (created signalled; RenderWindow puts a signalled one back over a submit that
+// failed), and covers every queue operation submitted before it. Ends at the first error, a lost device
+// included, which goes to check_vk_result.
+static VkResult ImGui_ImplVulkanH_WaitWindowFrames( VkDevice device, const ImGui_ImplVulkanH_Window* wd )
+{
+    for ( uint32_t i = 0; wd->Frames != NULL && i < wd->ImageCount; i++ )
+    {
+        if ( wd->Frames[i].Fence == VK_NULL_HANDLE )
+            continue;
+        const VkResult err = vkWaitForFences( device, 1, &wd->Frames[i].Fence, VK_TRUE, UINT64_MAX );
+        if ( err != VK_SUCCESS )
+        {
+            check_vk_result( err );
+            return err;
+        }
+    }
+    return VK_SUCCESS;
+}
+
 // Also destroy old swap chain and in-flight frames data, if any.
+// DesertEngine: no device idle here; the caller waited the window's own frames (CreateOrResizeWindow).
 void ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, VkDevice device, ImGui_ImplVulkanH_Window* wd, const VkAllocationCallbacks* allocator, int w, int h, uint32_t min_image_count)
 {
     VkResult err;
     VkSwapchainKHR old_swapchain = wd->Swapchain;
-    wd->Swapchain = VK_NULL_HANDLE;
-    err = vkDeviceWaitIdle(device);
-    check_vk_result(err);
+    wd->Swapchain                = VK_NULL_HANDLE;
 
     // We don't use ImGui_ImplVulkanH_DestroyWindow() because we want to preserve the old swapchain to create the new one.
     // Destroy old Framebuffer
@@ -1345,6 +1373,8 @@ void ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, V
         vkDestroyRenderPass(device, wd->RenderPass, allocator);
     if (wd->Pipeline)
         vkDestroyPipeline(device, wd->Pipeline, allocator);
+    wd->RenderPass = VK_NULL_HANDLE; // DesertEngine: a rebuild that stops early leaves nothing destroyed twice
+    wd->Pipeline   = VK_NULL_HANDLE;
 
     // If min image count was not specified, request different count of images dependent on selected present mode
     if (min_image_count == 0)
@@ -1384,8 +1414,21 @@ void ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, V
             info.imageExtent.width = wd->Width = cap.currentExtent.width;
             info.imageExtent.height = wd->Height = cap.currentExtent.height;
         }
-        err = vkCreateSwapchainKHR(device, &info, allocator, &wd->Swapchain);
-        check_vk_result(err);
+        // DesertEngine: a surface with no drawable area (a minimised window) takes no swapchain, and a failed
+        // create leaves none: the window has no frames, the old swapchain (retired either way) goes, and the
+        // value goes to check_vk_result for the caller to rebuild later.
+        if ( err == VK_SUCCESS && ( info.imageExtent.width == 0 || info.imageExtent.height == 0 ) )
+            err = VK_ERROR_OUT_OF_DATE_KHR;
+        if ( err == VK_SUCCESS )
+            err = vkCreateSwapchainKHR( device, &info, allocator, &wd->Swapchain );
+        if ( err != VK_SUCCESS )
+        {
+            wd->Swapchain = VK_NULL_HANDLE;
+            if ( old_swapchain )
+                vkDestroySwapchainKHR( device, old_swapchain, allocator );
+            check_vk_result( err );
+            return;
+        }
         err = vkGetSwapchainImagesKHR(device, wd->Swapchain, &wd->ImageCount, NULL);
         check_vk_result(err);
         VkImage backbuffers[16] = {};
@@ -1493,6 +1536,10 @@ void ImGui_ImplVulkanH_CreateOrResizeWindow(VkInstance instance, VkPhysicalDevic
 {
     IM_ASSERT(g_FunctionsLoaded && "Need to call ImGui_ImplVulkan_LoadFunctions() if IMGUI_IMPL_VULKAN_NO_PROTOTYPES or VK_NO_PROTOTYPES are set!");
     (void)instance;
+    // DesertEngine: nothing is rebuilt over a frame of the window still in flight; a failed wait leaves the
+    // window as it was (the error is the caller's value).
+    if ( ImGui_ImplVulkanH_WaitWindowFrames( device, wd ) != VK_SUCCESS )
+        return;
     ImGui_ImplVulkanH_CreateWindowSwapChain(physical_device, device, wd, allocator, width, height, min_image_count);
     //ImGui_ImplVulkan_CreatePipeline(device, allocator, VK_NULL_HANDLE, wd->RenderPass, VK_SAMPLE_COUNT_1_BIT, &wd->Pipeline, g_VulkanInitInfo.Subpass);
     ImGui_ImplVulkanH_CreateWindowCommandBuffers(physical_device, device, wd, queue_family, allocator);
@@ -1500,8 +1547,9 @@ void ImGui_ImplVulkanH_CreateOrResizeWindow(VkInstance instance, VkPhysicalDevic
 
 void ImGui_ImplVulkanH_DestroyWindow(VkInstance instance, VkDevice device, ImGui_ImplVulkanH_Window* wd, const VkAllocationCallbacks* allocator)
 {
-    vkDeviceWaitIdle(device); // FIXME: We could wait on the Queue if we had the queue in wd-> (otherwise VulkanH functions can't use globals)
-    //vkQueueWaitIdle(bd->Queue);
+    // DesertEngine: the window's own frames, not the device idle. Destruction goes on after a failed wait (a lost
+    // device answers every wait with an error, and destroying stays legal there).
+    (void)ImGui_ImplVulkanH_WaitWindowFrames( device, wd );
 
     for (uint32_t i = 0; i < wd->ImageCount; i++)
     {
@@ -1586,13 +1634,20 @@ static void ImGui_ImplVulkan_CreateWindow(ImGuiViewport* viewport)
     ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
     VkResult err = (VkResult)platform_io.Platform_CreateVkSurface(viewport, (ImU64)v->Instance, (const void*)v->Allocator, (ImU64*)&wd->Surface);
     check_vk_result(err);
+    // DesertEngine: a window whose surface, WSI support or swapchain failed has no frames, and the caller (which
+    // has the value from check_vk_result) does not draw it; DestroyWindow frees whatever was made.
+    if ( err != VK_SUCCESS )
+        return;
+    vd->WindowOwned = true;
 
     // Check for WSI support
-    VkBool32 res;
-    vkGetPhysicalDeviceSurfaceSupportKHR(v->PhysicalDevice, v->QueueFamily, wd->Surface, &res);
-    if (res != VK_TRUE)
+    VkBool32 res = VK_FALSE;
+    err          = vkGetPhysicalDeviceSurfaceSupportKHR( v->PhysicalDevice, v->QueueFamily, wd->Surface, &res );
+    if ( err == VK_SUCCESS && res != VK_TRUE )
+        err = VK_ERROR_FEATURE_NOT_PRESENT; // no WSI support for this surface on the queue family
+    if ( err != VK_SUCCESS )
     {
-        IM_ASSERT(0); // Error: no WSI support on physical device
+        check_vk_result( err );
         return;
     }
 
@@ -1649,27 +1704,47 @@ static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
 
     ImGui_ImplVulkanH_Frame* fd = &wd->Frames[wd->FrameIndex];
     ImGui_ImplVulkanH_FrameSemaphores* fsd = &wd->FrameSemaphores[wd->SemaphoreIndex];
+    // DesertEngine: every failure below ends this frame where it happens and goes to check_vk_result, which hands
+    // it to the caller as its value: nothing is submitted after a failed acquire (its semaphore never signals),
+    // nothing is presented (PresentPending stays false), and an OUT_OF_DATE / SUBOPTIMAL image is rebuilt by
+    // the caller where none of the window's frames is queued, not here.
+    vd->PresentPending = false;
     {
         {
-          err = vkAcquireNextImageKHR(v->Device, wd->Swapchain, UINT64_MAX, fsd->ImageAcquiredSemaphore, VK_NULL_HANDLE, &wd->FrameIndex);
-          check_vk_result(err);
-          fd = &wd->Frames[wd->FrameIndex];
+            uint32_t image_index = 0;
+            err = vkAcquireNextImageKHR( v->Device, wd->Swapchain, UINT64_MAX, fsd->ImageAcquiredSemaphore,
+                                         VK_NULL_HANDLE, &image_index );
+            if ( err != VK_SUCCESS )
+                check_vk_result( err ); // VK_SUBOPTIMAL_KHR acquired the image: drawn, then rebuilt by the caller
+            if ( err != VK_SUCCESS && err != VK_SUBOPTIMAL_KHR )
+                return;
+            wd->FrameIndex = image_index;
+            fd             = &wd->Frames[wd->FrameIndex];
         }
-        for (;;)
+        // DesertEngine: one wait that ends on success, VK_ERROR_DEVICE_LOST and every other error (the fence was
+        // submitted, created signalled, or put back signalled over a failed submit, so it signals).
+        err = vkWaitForFences( v->Device, 1, &fd->Fence, VK_TRUE, UINT64_MAX );
+        if ( err != VK_SUCCESS )
         {
-            err = vkWaitForFences(v->Device, 1, &fd->Fence, VK_TRUE, 100);
-            if (err == VK_SUCCESS) break;
-            if (err == VK_TIMEOUT) continue;
             check_vk_result(err);
+            return;
         }
         {
             err = vkResetCommandPool(v->Device, fd->CommandPool, 0);
-            check_vk_result(err);
+            if ( err != VK_SUCCESS )
+            {
+                check_vk_result( err );
+                return;
+            }
             VkCommandBufferBeginInfo info = {};
             info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             info.flags |= VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             err = vkBeginCommandBuffer(fd->CommandBuffer, &info);
-            check_vk_result(err);
+            if ( err != VK_SUCCESS )
+            {
+                check_vk_result( err );
+                return;
+            }
         }
         {
             ImVec4 clear_color = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
@@ -1704,11 +1779,32 @@ static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
             info.pSignalSemaphores = &fsd->RenderCompleteSemaphore;
 
             err = vkEndCommandBuffer(fd->CommandBuffer);
-            check_vk_result(err);
-            err = vkResetFences(v->Device, 1, &fd->Fence);
-            check_vk_result(err);
+            if ( err == VK_SUCCESS )
+                err = vkResetFences( v->Device, 1, &fd->Fence );
+            if ( err != VK_SUCCESS )
+            {
+                check_vk_result( err );
+                return;
+            }
             err = vkQueueSubmit(v->Queue, 1, &info, fd->Fence);
-            check_vk_result(err);
+            if ( err != VK_SUCCESS )
+            {
+                // DesertEngine: the batch was not queued, so the reset fence would never signal and the next
+                // wait on this frame (its draw, its rebuild, its destruction) would never return: a signalled
+                // one goes in its place. A lost device answers every wait with an error, so it keeps its own.
+                if ( err != VK_ERROR_DEVICE_LOST )
+                {
+                    vkDestroyFence( v->Device, fd->Fence, v->Allocator );
+                    fd->Fence                    = VK_NULL_HANDLE;
+                    VkFenceCreateInfo fence_info = {};
+                    fence_info.sType             = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+                    fence_info.flags             = VK_FENCE_CREATE_SIGNALED_BIT;
+                    check_vk_result( vkCreateFence( v->Device, &fence_info, v->Allocator, &fd->Fence ) );
+                }
+                check_vk_result( err );
+                return;
+            }
+            vd->PresentPending = true;
         }
     }
 }
@@ -1719,6 +1815,10 @@ static void ImGui_ImplVulkan_SwapBuffers(ImGuiViewport* viewport, void*)
     ImGui_ImplVulkan_ViewportData* vd = (ImGui_ImplVulkan_ViewportData*)viewport->RendererUserData;
     ImGui_ImplVulkanH_Window* wd = &vd->Window;
     ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
+    // DesertEngine: only an image RenderWindow acquired and submitted is presented.
+    if ( !vd->PresentPending )
+        return;
+    vd->PresentPending = false;
 
     VkResult err;
     uint32_t present_index = wd->FrameIndex;
@@ -1732,9 +1832,10 @@ static void ImGui_ImplVulkan_SwapBuffers(ImGuiViewport* viewport, void*)
     info.pSwapchains = &wd->Swapchain;
     info.pImageIndices = &present_index;
     err = vkQueuePresentKHR(v->Queue, &info);
-    if (err == VK_ERROR_OUT_OF_DATE_KHR || err == VK_SUBOPTIMAL_KHR)
-        ImGui_ImplVulkanH_CreateOrResizeWindow(v->Instance, v->PhysicalDevice, v->Device, &vd->Window, v->QueueFamily, v->Allocator, (int)viewport->Size.x, (int)viewport->Size.y, v->MinImageCount);
-    else
+    // DesertEngine: OUT_OF_DATE / SUBOPTIMAL go to the caller as values like every other result; the caller
+    // rebuilds the window where none of its frames is queued (a rebuild here ran on the submitting thread, by a
+    // size copied before the window changed, and was done a second time by the caller).
+    if ( err != VK_SUCCESS )
         check_vk_result(err);
 
     wd->FrameIndex = (wd->FrameIndex + 1) % wd->ImageCount;         // This is for the next vkWaitForFences()
