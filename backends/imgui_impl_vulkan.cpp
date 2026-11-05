@@ -1329,28 +1329,26 @@ int ImGui_ImplVulkanH_GetMinImageCountFromPresentMode(VkPresentModeKHR present_m
     return 1;
 }
 
-// DesertEngine: the window's own frames, in place of a device idle. Every frame's fence signals once the last
-// submit that used the frame ran (created signalled; RenderWindow puts a signalled one back over a submit that
-// failed), and covers every queue operation submitted before it. Ends at the first error, a lost device
-// included, which goes to check_vk_result.
-static VkResult ImGui_ImplVulkanH_WaitWindowFrames( VkDevice device, const ImGui_ImplVulkanH_Window* wd )
+// DesertEngine: THE ONE WAIT BEFORE A WINDOW'S OBJECTS GO, the application's (InitInfo::WaitWindowIdleFn), in
+// place of the device idle and of the frame fences: a fence covers the frame's submit, not the present that waits
+// on its RenderCompleteSemaphore (VUID-vkDestroySemaphore-semaphore-05149). The application owns the queue: it
+// flushes what it still holds for the queue, then idles it. A window with nothing made yet (a new one) has nothing
+// to wait for. The error, a lost device included, goes to check_vk_result.
+static VkResult ImGui_ImplVulkanH_WaitWindowIdle( const ImGui_ImplVulkanH_Window* wd )
 {
-    for ( uint32_t i = 0; wd->Frames != NULL && i < wd->ImageCount; i++ )
-    {
-        if ( wd->Frames[i].Fence == VK_NULL_HANDLE )
-            continue;
-        const VkResult err = vkWaitForFences( device, 1, &wd->Frames[i].Fence, VK_TRUE, UINT64_MAX );
-        if ( err != VK_SUCCESS )
-        {
-            check_vk_result( err );
-            return err;
-        }
-    }
-    return VK_SUCCESS;
+    if ( wd->Swapchain == VK_NULL_HANDLE && wd->Frames == NULL )
+        return VK_SUCCESS;
+    ImGui_ImplVulkan_Data* bd  = ImGui_ImplVulkan_GetBackendData();
+    VkResult               err = VK_ERROR_INITIALIZATION_FAILED; // no waiter: nothing is destroyed under the queue
+    if ( bd != nullptr && bd->VulkanInitInfo.WaitWindowIdleFn != nullptr )
+        err = bd->VulkanInitInfo.WaitWindowIdleFn( bd->VulkanInitInfo.Queue );
+    if ( err != VK_SUCCESS )
+        check_vk_result( err );
+    return err;
 }
 
 // Also destroy old swap chain and in-flight frames data, if any.
-// DesertEngine: no device idle here; the caller waited the window's own frames (CreateOrResizeWindow).
+// DesertEngine: no device idle here; the caller waited (CreateOrResizeWindow: ImGui_ImplVulkanH_WaitWindowIdle).
 void ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, VkDevice device, ImGui_ImplVulkanH_Window* wd, const VkAllocationCallbacks* allocator, int w, int h, uint32_t min_image_count)
 {
     VkResult err;
@@ -1536,9 +1534,9 @@ void ImGui_ImplVulkanH_CreateOrResizeWindow(VkInstance instance, VkPhysicalDevic
 {
     IM_ASSERT(g_FunctionsLoaded && "Need to call ImGui_ImplVulkan_LoadFunctions() if IMGUI_IMPL_VULKAN_NO_PROTOTYPES or VK_NO_PROTOTYPES are set!");
     (void)instance;
-    // DesertEngine: nothing is rebuilt over a frame of the window still in flight; a failed wait leaves the
-    // window as it was (the error is the caller's value).
-    if ( ImGui_ImplVulkanH_WaitWindowFrames( device, wd ) != VK_SUCCESS )
+    // DesertEngine: nothing is rebuilt over a frame or a present of the window still recorded or pending; a
+    // failed wait leaves the window as it was (the error is the caller's value).
+    if ( ImGui_ImplVulkanH_WaitWindowIdle( wd ) != VK_SUCCESS )
         return;
     ImGui_ImplVulkanH_CreateWindowSwapChain(physical_device, device, wd, allocator, width, height, min_image_count);
     //ImGui_ImplVulkan_CreatePipeline(device, allocator, VK_NULL_HANDLE, wd->RenderPass, VK_SAMPLE_COUNT_1_BIT, &wd->Pipeline, g_VulkanInitInfo.Subpass);
@@ -1547,9 +1545,9 @@ void ImGui_ImplVulkanH_CreateOrResizeWindow(VkInstance instance, VkPhysicalDevic
 
 void ImGui_ImplVulkanH_DestroyWindow(VkInstance instance, VkDevice device, ImGui_ImplVulkanH_Window* wd, const VkAllocationCallbacks* allocator)
 {
-    // DesertEngine: the window's own frames, not the device idle. Destruction goes on after a failed wait (a lost
-    // device answers every wait with an error, and destroying stays legal there).
-    (void)ImGui_ImplVulkanH_WaitWindowFrames( device, wd );
+    // DesertEngine: the application's wait (WaitWindowIdleFn), not the device idle. Destruction goes on after a
+    // failed wait (a lost device answers every wait with an error, and destroying stays legal there).
+    (void)ImGui_ImplVulkanH_WaitWindowIdle( wd );
 
     for (uint32_t i = 0; i < wd->ImageCount; i++)
     {

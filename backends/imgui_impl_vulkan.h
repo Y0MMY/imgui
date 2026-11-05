@@ -62,6 +62,14 @@ struct ImGui_ImplVulkan_InitInfo
     VkSampleCountFlagBits           MSAASamples;            // >= VK_SAMPLE_COUNT_1_BIT (0 -> default to VK_SAMPLE_COUNT_1_BIT)
     const VkAllocationCallbacks*    Allocator;
     void                            (*CheckVkResultFn)(VkResult err);
+    // DesertEngine: THE WAIT BEFORE A WINDOW'S SWAPCHAIN, SEMAPHORES AND FRAMES ARE DESTROYED (a rebuild over
+    // them, or the window's destruction), called with the queue the backend submits and presents on. Returns
+    // once no queue operation that uses them is recorded on the host or pending on @p queue, the present's wait
+    // on RenderCompleteSemaphore included (VUID-vkDestroySemaphore-semaphore-05149: a frame fence does not cover
+    // a vkQueuePresentKHR). The application owns the queue, so the application waits (UE: the RHI thread flushed,
+    // then the device idle); the backend has no waiter of its own. Required with platform windows: without it
+    // nothing is rebuilt and the error goes to CheckVkResultFn.
+    VkResult ( *WaitWindowIdleFn )( VkQueue queue );
 };
 
 // Called by user code
